@@ -17,6 +17,10 @@
 #include "esp_timer.h"
 #include "monitor.h"
 
+#if configTICK_RATE_HZ != 1000
+#error "Assignment 3 requires FreeRTOS tick = 1 ms (configTICK_RATE_HZ == 1000)."
+#endif
+
 // ----- Pin definitions -----
 
 // Inputs
@@ -53,8 +57,12 @@
 #define PERIOD_C_MS   50
 #define PERIOD_D_MS   50
 
+// Monitor reporting cadence (printed as [MON] lines on UART)
+#define MONITOR_REPORT_PERIOD_S 2u
+#define MONITOR_POLL_PERIOD_MS  100u
+
 // Enable/disable per-job UART logging (set to 1 for functional traces)
-#define TASK_UART_LOG_ENABLED 0
+#define TASK_UART_LOG_ENABLED 1
 
 #if TASK_UART_LOG_ENABLED
 #define TASK_LOG(...) printf(__VA_ARGS__)
@@ -71,6 +79,7 @@ uint32_t WorkKernel(uint32_t budget_cycles, uint32_t seed);
 
 static SemaphoreHandle_t g_sporadic_sem  = NULL;  // ISR → Task S
 static SemaphoreHandle_t g_token_mutex   = NULL;  // protects shared token state
+static SemaphoreHandle_t g_sync_sem      = NULL;  // ISR → app_main for first SYNC
 
 // ----- Shared state -----
 
@@ -102,6 +111,7 @@ static int g_pcnt_prev_b = 0;
 static volatile uint32_t g_sync_time_us   = 0;
 static volatile bool     g_sync_seen      = false;
 static volatile bool     g_schedule_started = false;
+static TickType_t g_sync_tick = 0;
 
 // ----- GPIO helpers -----
 
@@ -147,8 +157,13 @@ static void IRAM_ATTR isr_sync(void *arg)
     (void)arg;
     if (__atomic_load_n(&g_sync_seen, __ATOMIC_RELAXED)) return;
 
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     __atomic_store_n(&g_sync_time_us, (uint32_t)esp_timer_get_time(), __ATOMIC_RELAXED);
     __atomic_store_n(&g_sync_seen, true, __ATOMIC_RELEASE);
+    if (g_sync_sem != NULL) {
+        xSemaphoreGiveFromISR(g_sync_sem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
 }
 
 // ----- GPIO init -----
@@ -240,8 +255,15 @@ static void pcnt_init(void)
 static int64_t wait_for_sync_rising_edge(void)
 {
     __atomic_store_n(&g_sync_seen, false, __ATOMIC_RELEASE);
-    while (gpio_get_level(PIN_SYNC) != 0) {}
-    while (!__atomic_load_n(&g_sync_seen, __ATOMIC_ACQUIRE)) {}
+
+    while (gpio_get_level(PIN_SYNC) != 0) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    while (!__atomic_load_n(&g_sync_seen, __ATOMIC_ACQUIRE)) {
+        xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(100));
+    }
+
     return (int64_t)__atomic_load_n(&g_sync_time_us, __ATOMIC_ACQUIRE);
 }
 
@@ -275,12 +297,10 @@ static void reset_schedule_state(void)
 static void task_a_func(void *arg)
 {
     (void)arg;
-    TickType_t xLastWake = xTaskGetTickCount();
+    TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_A_MS);
 
     while (true) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-
         const uint32_t count_a = edge_count_a_last_period();
         const uint32_t id   = g_state.idx_a;
         const uint32_t seed = (id << 16) ^ count_a ^ 0xA1u;
@@ -299,6 +319,8 @@ static void task_a_func(void *arg)
         g_state.idx_a++;
 
         TASK_LOG("A,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_a, token);
+
+        vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
@@ -306,12 +328,10 @@ static void task_a_func(void *arg)
 static void task_b_func(void *arg)
 {
     (void)arg;
-    TickType_t xLastWake = xTaskGetTickCount();
+    TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_B_MS);
 
     while (true) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-
         const uint32_t count_b = edge_count_b_last_period();
         const uint32_t id   = g_state.idx_b;
         const uint32_t seed = (id << 16) ^ count_b ^ 0xB2u;
@@ -330,6 +350,8 @@ static void task_b_func(void *arg)
         g_state.idx_b++;
 
         TASK_LOG("B,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_b, token);
+
+        vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
@@ -337,12 +359,10 @@ static void task_b_func(void *arg)
 static void task_agg_func(void *arg)
 {
     (void)arg;
-    TickType_t xLastWake = xTaskGetTickCount();
+    TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_AGG_MS);
 
     while (true) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-
         xSemaphoreTake(g_token_mutex, portMAX_DELAY);
         const uint32_t agg = (g_state.token_a_valid && g_state.token_b_valid)
                                  ? (g_state.token_a ^ g_state.token_b)
@@ -361,6 +381,8 @@ static void task_agg_func(void *arg)
         g_state.idx_agg++;
 
         TASK_LOG("AGG,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, agg, token);
+
+        vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
@@ -368,13 +390,12 @@ static void task_agg_func(void *arg)
 static void task_c_func(void *arg)
 {
     (void)arg;
-    TickType_t xLastWake = xTaskGetTickCount();
+    TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_C_MS);
 
     while (true) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-
         if (gpio_get_level(PIN_IN_MODE) == 0) {
+            vTaskDelayUntil(&xLastWake, xPeriod);
             continue;  // mode disabled — skip, don't advance IDX
         }
 
@@ -390,6 +411,8 @@ static void task_c_func(void *arg)
         g_state.idx_c++;
 
         TASK_LOG("C,%" PRIu32 ",%" PRIu32 "\n", id, token);
+
+        vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
@@ -397,13 +420,12 @@ static void task_c_func(void *arg)
 static void task_d_func(void *arg)
 {
     (void)arg;
-    TickType_t xLastWake = xTaskGetTickCount();
+    TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_D_MS);
 
     while (true) {
-        vTaskDelayUntil(&xLastWake, xPeriod);
-
         if (gpio_get_level(PIN_IN_MODE) == 0) {
+            vTaskDelayUntil(&xLastWake, xPeriod);
             continue;  // mode disabled — skip, don't advance IDX
         }
 
@@ -419,6 +441,8 @@ static void task_d_func(void *arg)
         g_state.idx_d++;
 
         TASK_LOG("D,%" PRIu32 ",%" PRIu32 "\n", id, token);
+
+        vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
@@ -445,6 +469,17 @@ static void task_s_func(void *arg)
     }
 }
 
+// ----- Monitor polling task -----
+static void monitor_task_func(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        monitorPollReports();
+        vTaskDelay(pdMS_TO_TICKS(MONITOR_POLL_PERIOD_MS));
+    }
+}
+
 // ===================================================================
 // app_main — init, SYNC, create FreeRTOS tasks
 // ===================================================================
@@ -455,13 +490,21 @@ void app_main(void)
     gpio_init();
     pcnt_init();
 
+    g_sync_sem      = xSemaphoreCreateBinary();
     g_sporadic_sem = xSemaphoreCreateCounting(32, 0);
     g_token_mutex  = xSemaphoreCreateMutex();
+    if ((g_sync_sem == NULL) || (g_sporadic_sem == NULL) || (g_token_mutex == NULL)) {
+        ESP_LOGE(TAG, "Failed to create RTOS synchronization objects");
+        vTaskSuspend(NULL);
+    }
 
     ESP_LOGI(TAG, "Waiting for SYNC");
     const int64_t t0_us = wait_for_sync_rising_edge();
     reset_schedule_state();
     synch();
+    monitorSetPeriodicReportEverySeconds(MONITOR_REPORT_PERIOD_S);
+    monitorSetFinalReportAfterSeconds(0);
+    g_sync_tick = xTaskGetTickCount();
     __atomic_store_n(&g_schedule_started, true, __ATOMIC_RELEASE);
 
     ESP_LOGI(TAG, "Assignment 3 FreeRTOS started at T0=%" PRIi64 " us", t0_us);
@@ -474,13 +517,23 @@ void app_main(void)
     #define PRIO_S   5
     #define PRIO_C   3
     #define PRIO_D   3
+    #define PRIO_MON 1
 
-    xTaskCreatePinnedToCore(task_a_func,   "A",   4096, NULL, PRIO_A,   NULL, 0);
-    xTaskCreatePinnedToCore(task_b_func,   "B",   4096, NULL, PRIO_B,   NULL, 0);
-    xTaskCreatePinnedToCore(task_agg_func, "AGG", 4096, NULL, PRIO_AGG, NULL, 0);
-    xTaskCreatePinnedToCore(task_c_func,   "C",   4096, NULL, PRIO_C,   NULL, 0);
-    xTaskCreatePinnedToCore(task_d_func,   "D",   4096, NULL, PRIO_D,   NULL, 0);
-    xTaskCreatePinnedToCore(task_s_func,   "S",   4096, NULL, PRIO_S,   NULL, 0);
+    BaseType_t rc = pdPASS;
+    rc = xTaskCreatePinnedToCore(task_a_func,   "A",   4096, NULL, PRIO_A,   NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task A"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(task_b_func,   "B",   4096, NULL, PRIO_B,   NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task B"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(task_agg_func, "AGG", 4096, NULL, PRIO_AGG, NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task AGG"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(task_c_func,   "C",   4096, NULL, PRIO_C,   NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task C"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(task_d_func,   "D",   4096, NULL, PRIO_D,   NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task D"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(task_s_func,   "S",   4096, NULL, PRIO_S,   NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task S"); vTaskSuspend(NULL); }
+    rc = xTaskCreatePinnedToCore(monitor_task_func, "MON", 3072, NULL, PRIO_MON, NULL, 0);
+    if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create monitor task"); vTaskSuspend(NULL); }
 
     // app_main task is no longer needed
     vTaskDelete(NULL);
