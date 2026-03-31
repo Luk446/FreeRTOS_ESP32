@@ -1,13 +1,25 @@
-// ----- Includes -----
+
+/*
+    *** Includes, configs and macros ***
+*/
+
+
+// ----- Headers -----
+
+// standard C libs
 
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
+// freertos headers
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+
+// esp-idf headers
 
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
@@ -17,11 +29,13 @@
 #include "esp_timer.h"
 #include "monitor.h"
 
+// project constraints
+
 #if configTICK_RATE_HZ != 1000
 #error "Assignment 3 requires FreeRTOS tick = 1 ms (configTICK_RATE_HZ == 1000)."
 #endif
 
-// ----- Pin definitions -----
+// ----- Pin Definitions -----
 
 // Inputs
 #define PIN_SYNC    13
@@ -38,7 +52,9 @@
 #define ACK_D   21
 #define ACK_S   22
 
-// ----- WorkKernel budgets (ESP32 Wroom @ 240 MHz) -----
+// ----- duration configs -----
+
+// WorkKernel budgets (ESP32 Wroom @ 240 MHz)
 
 #define BUDGET_A_CYCLES     672000u
 #define BUDGET_B_CYCLES     960000u
@@ -49,7 +65,7 @@
 
 #define AGG_FALLBACK_TOKEN  0xDEADBEEFu
 
-// ----- Task periods (ms) -----
+// Task periods (ms)
 
 #define PERIOD_A_MS   10
 #define PERIOD_B_MS   20
@@ -57,13 +73,14 @@
 #define PERIOD_C_MS   50
 #define PERIOD_D_MS   50
 
-// Monitor reporting cadence (printed as [MON] lines on UART)
+// Monitor reporting frequency
 #define MONITOR_REPORT_PERIOD_S 2u
 #define MONITOR_POLL_PERIOD_MS  100u
 
-// Enable/disable per-job UART logging (set to 1 for functional traces)
-#define TASK_UART_LOG_ENABLED 1
+// Enable/disable per-task UART logging
+#define TASK_UART_LOG_ENABLED 0
 
+// conditional for task logging 
 #if TASK_UART_LOG_ENABLED
 #define TASK_LOG(...) printf(__VA_ARGS__)
 #else
@@ -72,17 +89,23 @@
 
 static const char *TAG = "assignment3";
 
-// WorkKernel prototype (provided, must not be modified)
+// WorkKernel input
 uint32_t WorkKernel(uint32_t budget_cycles, uint32_t seed);
 
-// ----- FreeRTOS synchronisation objects -----
+/*
+    *** Synchronization objects, shared state ***
+*/
 
+// FreeRTOS synchronisation objects 
+
+// Task S is released by the PIN_IN_S ISR, which gives this semaphore
 static SemaphoreHandle_t g_sporadic_sem  = NULL;  // ISR → Task S
+// generated tokens that AGG reads from A/B, protected by mutex
 static SemaphoreHandle_t g_token_mutex   = NULL;  // protects shared token state
+// SYNC ISR gives this semaphore to unblock
 static SemaphoreHandle_t g_sync_sem      = NULL;  // ISR → app_main for first SYNC
 
-// ----- Shared state -----
-
+// shared state - global struct that tracks the; execution index of each task, tokens from A/B, and bool flags 
 typedef struct {
     uint32_t idx_a;
     uint32_t idx_b;
@@ -97,29 +120,55 @@ typedef struct {
     uint32_t token_b;
 } sched_state_t;
 
+// global state variable
 static sched_state_t g_state;
+
+/*
+    *** Hardware init (GPIO, PCNT) ***
+*/
 
 // ----- PCNT handles -----
 
+// PCNT units for counting edges on PIN_IN_A and PIN_IN_B
 static pcnt_unit_handle_t g_pcnt_unit_a = NULL;
 static pcnt_unit_handle_t g_pcnt_unit_b = NULL;
+
+// previous counts for delta calc
 static int g_pcnt_prev_a = 0;
 static int g_pcnt_prev_b = 0;
 
 // ----- SYNC state -----
 
+// SYNC timestamp (microseconds)
 static volatile uint32_t g_sync_time_us   = 0;
+
+// SYNC seen flag and schedule started flag 
 static volatile bool     g_sync_seen      = false;
 static volatile bool     g_schedule_started = false;
+
+// SYNC tick (FreeRTOS ticks)
 static TickType_t g_sync_tick = 0;
 
 // ----- GPIO helpers -----
 
+// configures ACK GPIOs
 static inline void ack_high(gpio_num_t pin) { gpio_set_level(pin, 1); }
 static inline void ack_low(gpio_num_t pin)  { gpio_set_level(pin, 0); }
+
+// Get current time in ms
 static inline int64_t now_us(void)          { return esp_timer_get_time(); }
 
-// ----- Edge counting (PCNT delta-per-period) -----
+/*
+    *** Edge counting and ISRs ***
+*/
+
+// ----- Edge counting for A and B O(1) -----
+
+// functions do:
+// read current count from PCNT,
+// compute delta from previous count
+// store current count
+// return delta
 
 static uint32_t edge_count_a_last_period(void)
 {
@@ -141,6 +190,9 @@ static uint32_t edge_count_b_last_period(void)
 
 // ----- ISRs -----
 
+// grab timestamp of SYNC
+// set a flag that SYNC has been seen
+// give semaphore to unblock app_main waiting for SYNC
 static void IRAM_ATTR isr_in_s(void *arg)
 {
     (void)arg;
@@ -152,6 +204,11 @@ static void IRAM_ATTR isr_in_s(void *arg)
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
+// SYNC ISR
+// if SYNC already seen, return
+// else grab timestamp
+// set SYNC seen flag
+// give semaphore to unblock app_main waiting for SYNC
 static void IRAM_ATTR isr_sync(void *arg)
 {
     (void)arg;
@@ -473,10 +530,21 @@ static void task_s_func(void *arg)
 static void monitor_task_func(void *arg)
 {
     (void)arg;
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xPeriod = pdMS_TO_TICKS(MONITOR_REPORT_PERIOD_S * 1000);
 
     while (true) {
+        // Clear screen and move cursor to home
+        printf("\033[2J\033[H");
+        
+        printf("========================================\n");
+        printf("      ESP32 FreeRTOS Task Monitor       \n");
+        printf("========================================\n");
+
+        monitorReport();
         monitorPollReports();
-        vTaskDelay(pdMS_TO_TICKS(MONITOR_POLL_PERIOD_MS));
+
+        vTaskDelayUntil(&xLastWakeTime, xPeriod);
     }
 }
 
@@ -502,8 +570,9 @@ void app_main(void)
     const int64_t t0_us = wait_for_sync_rising_edge();
     reset_schedule_state();
     synch();
-    monitorSetPeriodicReportEverySeconds(MONITOR_REPORT_PERIOD_S);
+    monitorSetPeriodicReportEverySeconds(0);
     monitorSetFinalReportAfterSeconds(0);
+
     g_sync_tick = xTaskGetTickCount();
     __atomic_store_n(&g_schedule_started, true, __ATOMIC_RELEASE);
 
