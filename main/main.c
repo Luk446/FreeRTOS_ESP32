@@ -190,9 +190,11 @@ static uint32_t edge_count_b_last_period(void)
 
 // ----- ISRs -----
 
-// grab timestamp of SYNC
-// set a flag that SYNC has been seen
-// give semaphore to unblock app_main waiting for SYNC
+// sporadic trigger
+// ]when rising edge detected
+// fire ISR 
+// checks if schedule started
+// tells freeRTOS to unblock Task S by giving g_sporadic_sem  (high priority)
 static void IRAM_ATTR isr_in_s(void *arg)
 {
     (void)arg;
@@ -205,6 +207,7 @@ static void IRAM_ATTR isr_in_s(void *arg)
 }
 
 // SYNC ISR
+// trigger on rising edge of SYNC pin
 // if SYNC already seen, return
 // else grab timestamp
 // set SYNC seen flag
@@ -223,10 +226,14 @@ static void IRAM_ATTR isr_sync(void *arg)
     }
 }
 
-// ----- GPIO init -----
+/*
+    *** Hardware init (GPIO, PCNT) ***
+*/
 
+// GPIO init
 static void gpio_init(void)
 {
+    // Configure input pins with pull-downs
     const gpio_config_t input_conf = {
         .pin_bit_mask = (1ULL << PIN_SYNC) |
                         (1ULL << PIN_IN_S) |
@@ -237,6 +244,7 @@ static void gpio_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
 
+    // Configure output pins (ACKs)
     const gpio_config_t output_conf = {
         .pin_bit_mask = (1ULL << ACK_A) |
                         (1ULL << ACK_B) |
@@ -250,13 +258,16 @@ static void gpio_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
 
+    // apply configurations
     ESP_ERROR_CHECK(gpio_config(&input_conf));
     ESP_ERROR_CHECK(gpio_config(&output_conf));
 
+    // set pull-downs for input pins
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_SYNC, GPIO_PULLDOWN_ONLY));
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_S, GPIO_PULLDOWN_ONLY));
     ESP_ERROR_CHECK(gpio_set_pull_mode(PIN_IN_MODE, GPIO_PULLDOWN_ONLY));
 
+    // initialize ACKs to low
     ack_low(ACK_A);
     ack_low(ACK_B);
     ack_low(ACK_AGG);
@@ -264,6 +275,7 @@ static void gpio_init(void)
     ack_low(ACK_D);
     ack_low(ACK_S);
 
+    // install GPIO ISR service and add ISRs for SYNC and PIN_IN_S
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
     ESP_ERROR_CHECK(gpio_set_intr_type(PIN_SYNC, GPIO_INTR_POSEDGE));
     ESP_ERROR_CHECK(gpio_set_intr_type(PIN_IN_S, GPIO_INTR_POSEDGE));
@@ -271,21 +283,35 @@ static void gpio_init(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_IN_S, isr_in_s, NULL));
 }
 
-// ----- PCNT init (same as Assignment 2) -----
+// ----- PCNT init -----
 
 static void pcnt_init(void)
 {
+    // create two PCNT units 
+    // watch limits for hardware counter
     const pcnt_unit_config_t unit_cfg = {
         .low_limit  = -1,
         .high_limit = 30000,
         .flags      = { .accum_count = 1 },
     };
+
+    // create the two PCNT units with the same config, but different handles
     ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &g_pcnt_unit_a));
     ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &g_pcnt_unit_b));
 
+    // config the glitch filter
+    // reject the pulses shorter than 1us to avoid triggering by noise
     const pcnt_glitch_filter_config_t filter_cfg = { .max_glitch_ns = 1000 };
     ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(g_pcnt_unit_a, &filter_cfg));
     ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(g_pcnt_unit_b, &filter_cfg));
+
+    // ----- configure channels for A and B -----
+
+    // for each PNCT unit
+    // connect to GPIO
+    // rising edge - increment count
+    // falling edge - hold
+    // level actions dont matter 
 
     const pcnt_chan_config_t chan_a_cfg = { .edge_gpio_num = PIN_IN_A, .level_gpio_num = -1 };
     pcnt_channel_handle_t chan_a;
@@ -299,33 +325,44 @@ static void pcnt_init(void)
     ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD));
     ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_KEEP));
 
+    // ----- enable, clear, and start both counters -----
+
+    // activate PCNT unit in driver
     ESP_ERROR_CHECK(pcnt_unit_enable(g_pcnt_unit_a));
     ESP_ERROR_CHECK(pcnt_unit_enable(g_pcnt_unit_b));
+    // start from zero
     ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_a));
     ESP_ERROR_CHECK(pcnt_unit_clear_count(g_pcnt_unit_b));
+    // start counting
     ESP_ERROR_CHECK(pcnt_unit_start(g_pcnt_unit_a));
     ESP_ERROR_CHECK(pcnt_unit_start(g_pcnt_unit_b));
 }
 
 // ----- SYNC wait -----
 
+// two-phase blocking
 static int64_t wait_for_sync_rising_edge(void)
 {
+    // clear SYNC seen flag 
     __atomic_store_n(&g_sync_seen, false, __ATOMIC_RELEASE);
 
+    // wait for SYNC pin to go high
     while (gpio_get_level(PIN_SYNC) != 0) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    // now wait for the SYNC ISR to set the seen flag and timestamp
     while (!__atomic_load_n(&g_sync_seen, __ATOMIC_ACQUIRE)) {
         xSemaphoreTake(g_sync_sem, pdMS_TO_TICKS(100));
     }
 
+    // return the SYNC timestamp
     return (int64_t)__atomic_load_n(&g_sync_time_us, __ATOMIC_ACQUIRE);
 }
 
 // ----- State reset -----
 
+// reset the global state and counters to prepare for a new schedule run
 static void reset_schedule_state(void)
 {
     g_state.idx_a   = 0;
@@ -346,42 +383,66 @@ static void reset_schedule_state(void)
     g_state.token_b = 0;
 }
 
-// ===================================================================
-// FreeRTOS Task Functions
-// ===================================================================
 
-// ----- Task A: period 10 ms -----
+/*
+    FreeRTOS Task Functions
+*/
+
+// ----- General Task Format -----
+
+// - local setup at
+// - init timing 
+// - loop
+// - wait for release condition 
+// - for periodic - run each loop cycle and finish with vTaskDelayUntil
+// - for sporadic - wait on semaphore, then run immediately
+// - build job input
+// - instrumentation and execution of WorkKernel
+// - shared state updates
+// - logging
+// - reschedule
+
+
+// Task A: period 10 ms
 static void task_a_func(void *arg)
 {
     (void)arg;
+    // init timing variables for vTaskDelayUntil
     TickType_t xLastWake = g_sync_tick;
     const TickType_t xPeriod = pdMS_TO_TICKS(PERIOD_A_MS);
 
+    // main loop
     while (true) {
+        // build WorkKernel input
         const uint32_t count_a = edge_count_a_last_period();
         const uint32_t id   = g_state.idx_a;
         const uint32_t seed = (id << 16) ^ count_a ^ 0xA1u;
 
+        // instrumentation and execution
         beginTaskA(id);
         ack_high(ACK_A);
         const uint32_t token = WorkKernel(BUDGET_A_CYCLES, seed);
         ack_low(ACK_A);
         endTaskA();
 
+        // update shared state with token for AGG
         xSemaphoreTake(g_token_mutex, portMAX_DELAY);
         g_state.token_a = token;
         g_state.token_a_valid = true;
         xSemaphoreGive(g_token_mutex);
 
+        // increment execution index
         g_state.idx_a++;
 
+        // logging
         TASK_LOG("A,%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n", id, count_a, token);
 
+        // wait for next period
         vTaskDelayUntil(&xLastWake, xPeriod);
     }
 }
 
-// ----- Task B: period 20 ms -----
+// Task B: period 20 ms
 static void task_b_func(void *arg)
 {
     (void)arg;
@@ -412,7 +473,7 @@ static void task_b_func(void *arg)
     }
 }
 
-// ----- Task AGG: period 20 ms -----
+// Task AGG: period 20 ms 
 static void task_agg_func(void *arg)
 {
     (void)arg;
@@ -443,7 +504,7 @@ static void task_agg_func(void *arg)
     }
 }
 
-// ----- Task C: period 50 ms, mode-controlled -----
+//  Task C: period 50 ms, mode-controlled 
 static void task_c_func(void *arg)
 {
     (void)arg;
@@ -473,7 +534,7 @@ static void task_c_func(void *arg)
     }
 }
 
-// ----- Task D: period 50 ms, mode-controlled -----
+// Task D: period 50 ms, mode-controlled 
 static void task_d_func(void *arg)
 {
     (void)arg;
@@ -503,7 +564,7 @@ static void task_d_func(void *arg)
     }
 }
 
-// ----- Task S: sporadic, semaphore-driven -----
+// Task S: sporadic, semaphore-driven 
 static void task_s_func(void *arg)
 {
     (void)arg;
@@ -526,13 +587,22 @@ static void task_s_func(void *arg)
     }
 }
 
-// ----- Monitor polling task -----
+// ----- Dashboard Monitor Task -----
+
+// to slot in monitor without losing time we define as a task
+// it is also configured to run so that the output clears the screen and its easy to read
+
 static void monitor_task_func(void *arg)
 {
     (void)arg;
+    // init timing for periodic reporting
     TickType_t xLastWakeTime = xTaskGetTickCount();
+    // set period for monitor reporting
     const TickType_t xPeriod = pdMS_TO_TICKS(MONITOR_REPORT_PERIOD_S * 1000);
 
+    // main loop: 
+    // - clear screen and print header
+    // - call monitorReport to print current state of tasks
     while (true) {
         // Clear screen and move cursor to home
         printf("\033[2J\033[H");
@@ -548,46 +618,78 @@ static void monitor_task_func(void *arg)
     }
 }
 
-// ===================================================================
-// app_main — init, SYNC, create FreeRTOS tasks
-// ===================================================================
+/*
+    app_main — init, SYNC, create FreeRTOS tasks
+*/
 
 void app_main(void)
 {
+    // init subsystems
+    // monitor, GPIO, PCNT
     monitorInit();
     gpio_init();
     pcnt_init();
 
+    // ----- create RTOS sync obj -----
+
+    // binary semaphore for SYNC ISR
     g_sync_sem      = xSemaphoreCreateBinary();
+    // counting semaphore for sporadic ISR
     g_sporadic_sem = xSemaphoreCreateCounting(32, 0);
+    // mutex for protecting shared token state
     g_token_mutex  = xSemaphoreCreateMutex();
+
+    // ----- wait for global sync event -----
+
+    // also do check whether sempaphores created successfully 
     if ((g_sync_sem == NULL) || (g_sporadic_sem == NULL) || (g_token_mutex == NULL)) {
         ESP_LOGE(TAG, "Failed to create RTOS synchronization objects");
         vTaskSuspend(NULL);
     }
 
+    // block until SYNC ISR records first edge
     ESP_LOGI(TAG, "Waiting for SYNC");
+    // store us timestamp
     const int64_t t0_us = wait_for_sync_rising_edge();
+    // clear task idx and counters
     reset_schedule_state();
+    // notify monitor
     synch();
+    // ovveride the monitor period 
     monitorSetPeriodicReportEverySeconds(0);
     monitorSetFinalReportAfterSeconds(0);
 
-    g_sync_tick = xTaskGetTickCount();
-    __atomic_store_n(&g_schedule_started, true, __ATOMIC_RELEASE);
+    // ----- capture sched epoch and open releases
 
+    // freeRTOS reference 
+    g_sync_tick = xTaskGetTickCount();
+    // tell ISR that sched is live
+    __atomic_store_n(&g_schedule_started, true, __ATOMIC_RELEASE);
+    // log
     ESP_LOGI(TAG, "Assignment 3 FreeRTOS started at T0=%" PRIi64 " us", t0_us);
 
     // Task priorities — Rate Monotonic: shorter period = higher priority.
     // Task S at priority 5 so it can preempt C/D but not A.
+    // task priority set by period 
     #define PRIO_A   6
     #define PRIO_B   5
     #define PRIO_AGG 4
     #define PRIO_S   5
     #define PRIO_C   3
     #define PRIO_D   3
-    #define PRIO_MON 1
+    #define PRIO_MON 1 // monitor at lowest priority so it doesnt cause fails in other tasks
 
+    // ----- create tasks -----
+
+    // for each task
+    // - function pointer gives task body
+    // - assign name for debug
+    // - give stack size
+    // - pass NULL for parameters
+    // - assign priority 
+    // - discard task handle
+    // - pin to core 0 since we want single core
+    
     BaseType_t rc = pdPASS;
     rc = xTaskCreatePinnedToCore(task_a_func,   "A",   4096, NULL, PRIO_A,   NULL, 0);
     if (rc != pdPASS) { ESP_LOGE(TAG, "Failed to create task A"); vTaskSuspend(NULL); }
