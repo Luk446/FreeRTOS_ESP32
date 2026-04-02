@@ -13,6 +13,9 @@
 *.bak
 *.tmp
 
+# workspace
+*.code-workspace
+
 # Log files
 *.log
 

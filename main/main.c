@@ -674,11 +674,11 @@ void app_main(void)
     #define PRIO_A   6
     #define PRIO_B   5
     #define PRIO_AGG 4
-    #define PRIO_S   5
+    #define PRIO_S   2
     #define PRIO_C   3
     #define PRIO_D   3
     #define PRIO_MON 1 // monitor at lowest priority so it doesnt cause fails in other tasks
-
+    // fix priotity for s being the lowest !!
     // ----- create tasks -----
 
     // for each task
