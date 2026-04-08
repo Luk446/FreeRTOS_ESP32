@@ -15,4 +15,8 @@ ESP32 FreeRTOS scheduler with 6 periodic + 1 sporadic task. SYNC-anchored releas
 	- Monitor: low-priority reporting task
 - Data flow: A/B count edges and generate tokens; AGG combines A/B tokens; C/D are mode-gated by `PIN_IN_MODE`; S runs on interrupt-triggered semaphore release.
 - Scheduling: Fixed-priority, rate-monotonic ordering; all tasks pinned to core 0.
-- Observability: ACK GPIOs go high/low around task execution; monitor hooks/reporting provide runtime timing and deadline stats.
+- Observability: ACK GPIOs go high/low around task execution; monitor hooks/reporting provide runtime timing and deadline stats.]
+
+## FreeRTOS API and RTOS usage
+
+![flowchart](docs\mermaid-diagram-2026-04-08-181007.png) 

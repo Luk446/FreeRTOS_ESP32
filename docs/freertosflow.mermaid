@@ -1,0 +1,71 @@
+flowchart TD
+	A[app_main starts] --> B[Init monitor, GPIO and PCNT]
+	B --> C[Create FreeRTOS sync objects<br/>g_sync_sem binary semaphore<br/>g_sporadic_sem counting semaphore<br/>g_token_mutex mutex]
+	C --> D[Wait for first SYNC rising edge]
+	D --> E[SYNC ISR captures T0 and gives g_sync_sem]
+	E --> F[Reset scheduler state<br/>set g_sync_tick<br/>enable schedule_started]
+	F --> G[Create pinned tasks on core 0]
+	G --> H[FreeRTOS scheduler runs tasks independently]
+
+	subgraph Tasks[Task Set]
+		T1[A: periodic 10 ms<br/>priority 6]
+		T2[B: periodic 20 ms<br/>priority 5]
+		T3[AGG: periodic 20 ms<br/>priority 4]
+		T4[C and D: periodic 50 ms<br/>priority 3<br/>run only if IN_MODE = 1]
+		T5[S: sporadic<br/>released by semaphore<br/>priority 2]
+		T6[MON: periodic 2 s<br/>priority 1]
+	end
+
+	G -. creates .-> Tasks
+
+	subgraph PeriodicTasks[Periodic FreeRTOS Pattern]
+		P1[Each periodic task starts from g_sync_tick]
+		P2[Build seed and read inputs<br/>A and B read PCNT edge deltas]
+		P3[ACK high -> WorkKernel -> ACK low]
+		P4[Update IDX and optional UART log]
+		P5[vTaskDelayUntil keeps releases aligned to T0]
+		P1 --> P2 --> P3 --> P4 --> P5 --> P2
+	end
+
+	subgraph SharedTokens[Semaphore Protected Shared State]
+		S1[Task A locks g_token_mutex<br/>publish token_a]
+		S2[Task B locks g_token_mutex<br/>publish token_b]
+		S3[Task AGG locks g_token_mutex<br/>combine token_a and token_b<br/>or use 0xDEADBEEF fallback]
+	end
+
+	subgraph SporadicPath[Sporadic Semaphore Path]
+		SP1[IN_S rising edge triggers ISR]
+		SP2[ISR gives g_sporadic_sem]
+		SP3[Task S unblocks from xSemaphoreTake]
+		SP4[Task S runs ACK high -> WorkKernel -> ACK low]
+		SP1 --> SP2 --> SP3 --> SP4
+	end
+
+	subgraph ModeControl[Mode-Controlled Tasks]
+		M1[Task C wakes every 50 ms]
+		M2[Task D wakes every 50 ms]
+		M3{IN_MODE == 0?}
+		M4[Skip compute and keep IDX unchanged]
+		M5[Otherwise run normal periodic job]
+		M1 --> M3
+		M2 --> M3
+		M3 -- yes --> M4
+		M3 -- no --> M5
+	end
+
+	subgraph Monitor[Low-Priority Monitor]
+		MO1[Monitor task wakes every 2 s]
+		MO2[Clear terminal and print monitor output]
+		MO3[vTaskDelayUntil for next report]
+		MO1 --> MO2 --> MO3 --> MO1
+	end
+
+	T1 -. follows .-> PeriodicTasks
+	T2 -. follows .-> PeriodicTasks
+	T3 -. follows .-> PeriodicTasks
+	T1 -. publishes through .-> SharedTokens
+	T2 -. publishes through .-> SharedTokens
+	T3 -. reads through .-> SharedTokens
+	T5 -. released by .-> SporadicPath
+	T4 -. gated by .-> ModeControl
+	T6 -. runs .-> Monitor
