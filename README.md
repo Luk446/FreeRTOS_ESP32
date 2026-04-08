@@ -19,4 +19,4 @@ ESP32 FreeRTOS scheduler with 6 periodic + 1 sporadic task. SYNC-anchored releas
 
 ## FreeRTOS API and RTOS usage
 
-![flowchart](docs\mermaid-diagram-2026-04-08-181007.png) 
+![flowchart](docs/mermaid-diagram-2026-04-08-181007.png) 
